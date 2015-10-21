@@ -1,6 +1,6 @@
-import sys
 import json
 import os
+import sys
 
 try:
     from unittest import mock
@@ -13,13 +13,16 @@ except ImportError:
     from StringIO import StringIO
 
 import py
+import arrow
+import pkg_resources  # noqa
 import pytest
 import requests
-import arrow
 
 from click import get_app_dir
 from watson import Watson, WatsonError
+from watson.artichio import ArtichIOSync
 from watson.watson import ConfigurationError, ConfigParser
+
 
 TEST_FIXTURE_DIR = py.path.local(
     os.path.dirname(
@@ -552,6 +555,98 @@ def test_save_empty_last_sync(config_dir):
             assert json_mock.call_args[0][0] == 0
 
 
+# push/pull backend loading
+
+def test_load_default_backend(watson):
+    watson.config = ConfigParser()
+    backend = watson._load_backend()
+    assert backend is ArtichIOSync
+
+
+def test_load_unknown_backend(watson):
+    config = ConfigParser()
+    config.add_section('backend')
+    config.set('backend', 'name', 'unknown')
+    watson.config = config
+
+    with pytest.raises(WatsonError) as exc:
+        watson._load_backend()
+
+    assert str(exc.value) == "Sync backend 'unknown' is not installed."
+
+
+def test_load_empty_backend(watson):
+    config = ConfigParser()
+    config.add_section('backend')
+    config.set('backend', 'name', '')
+    watson.config = config
+
+    with pytest.raises(WatsonError) as exc:
+        watson._load_backend()
+
+    assert str(exc.value) == "Sync backend name must not be empty."
+
+
+def test_load_backend_error(watson):
+    config = ConfigParser()
+    config.add_section('backend')
+    config.set('backend', 'name', 'broken')
+    watson.config = config
+
+    class BrokenBackendEntryPoint:
+        name = 'broken'
+
+        def load(self):
+            raise Exception('Boom!')
+
+    with mock.patch('pkg_resources.iter_entry_points') as mock_iep:
+        mock_iep.return_value = (BrokenBackendEntryPoint(),)
+
+        with pytest.raises(WatsonError) as exc:
+            watson._load_backend()
+
+        assert str(exc.value) == "Sync backend 'broken' failed to load: Boom!"
+
+
+def test_load_custom_backend_from_config(watson):
+    config = ConfigParser()
+    config.add_section('backend')
+    config.set('backend', 'name', 'custom')
+    watson.config = config
+
+    class MockCustomBackend:
+        pass
+
+    class MockEntryPoint:
+        name = 'custom'
+
+        def load(self):
+            return MockCustomBackend
+
+    with mock.patch('pkg_resources.iter_entry_points') as mock_iep:
+        mock_iep.return_value = (MockEntryPoint(),)
+
+        backend = watson._load_backend()
+        assert backend is MockCustomBackend
+
+
+def test_load_custom_backend_by_param(watson):
+    class MockCustomBackend:
+        pass
+
+    class MockEntryPoint:
+        name = 'custom'
+
+        def load(self):
+            return MockCustomBackend
+
+    with mock.patch('pkg_resources.iter_entry_points') as mock_iep:
+        mock_iep.return_value = (MockEntryPoint(),)
+
+        backend = watson._load_backend('custom')
+        assert backend is MockCustomBackend
+
+
 # push
 
 def test_push_with_no_config(watson):
@@ -601,7 +696,7 @@ def test_push(watson, monkeypatch):
     watson.frames.add('foo', 1, 2)
     watson.frames.add('bar', 3, 4)
 
-    monkeypatch.setattr(watson, '_get_remote_projects', lambda *args: [
+    monkeypatch.setattr(ArtichIOSync, '_get_remote_projects', lambda *args: [
         {'name': 'foo', 'url': '/projects/1/'},
         {'name': 'bar', 'url': '/projects/2/'},
         {'name': 'lol', 'url': '/projects/3/'},
@@ -679,7 +774,7 @@ def test_pull(watson, monkeypatch):
 
     watson.frames.add('foo', 1, 2, ['A', 'B'], id='1')
 
-    monkeypatch.setattr(watson, '_get_remote_projects', lambda *args: [
+    monkeypatch.setattr(ArtichIOSync, '_get_remote_projects', lambda *args: [
         {'name': 'foo', 'url': '/projects/1/'},
         {'name': 'bar', 'url': '/projects/2/'},
     ])
@@ -721,12 +816,14 @@ def test_pull(watson, monkeypatch):
     assert watson.frames[0].start.timestamp == 3
     assert watson.frames[0].stop.timestamp == 4
     assert watson.frames[0].tags == ['A']
+    assert watson.frames[0].updated_at > watson.last_sync
 
     assert watson.frames[1].id == '2'
     assert watson.frames[1].project == 'bar'
     assert watson.frames[1].start.timestamp == 4
     assert watson.frames[1].stop.timestamp == 5
     assert watson.frames[1].tags == []
+    assert watson.frames[0].updated_at > watson.last_sync
 
 
 # projects

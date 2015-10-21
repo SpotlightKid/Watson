@@ -49,6 +49,9 @@ setup(
     entry_points={
         'console_scripts': [
             'watson = watson.__main__:cli',
+        ],
+        'watson.sync': [
+            'artichio = watson.artichio:ArtichIOSync',
         ]
     },
     classifiers=[

@@ -114,6 +114,13 @@ class Frames(object):
         else:
             del self._rows[self._get_index_by_id(key)]
 
+    def __contains__(self, key):
+        for frame in self._rows:
+            if frame.id == key:
+                return True
+        else:
+            return False
+
     def _get_index_by_id(self, id):
         try:
             return next(

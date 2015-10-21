@@ -10,7 +10,7 @@ except ImportError:
 
 import arrow
 import click
-import requests
+import pkg_resources
 
 from .config import ConfigParser
 from .frames import Frames
@@ -284,126 +284,48 @@ class Watson(object):
         """
         return sorted(set(tag for tags in self.frames['tags'] for tag in tags))
 
-    def _get_request_info(self, route):
-        config = self.config
+    def _load_backend(self, name=None):
+        if not name:
+            name = (self.config.get('backend', 'name')
+                    if self.config.has_option('backend', 'name')
+                    else 'artichio')
 
-        dest = config.get('backend', 'url')
-        token = config.get('backend', 'token')
+        if not name:
+            raise WatsonError("Sync backend name must not be empty.")
 
-        if dest and token:
-            dest = "{}/{}/".format(
-                dest.rstrip('/'),
-                route.strip('/')
-            )
+        for plugin in pkg_resources.iter_entry_points('watson.sync'):
+            if plugin.name == name:
+                try:
+                    return plugin.load()
+                except Exception as exc:
+                    raise WatsonError(
+                        "Sync backend '{}' failed to load: {}".format(
+                            name, exc
+                        )
+                    )
         else:
-            raise ConfigurationError(
-                "You must specify a remote URL (backend.url) and a token "
-                "(backend.token) using the config command."
-            )
-
-        headers = {
-            'content-type': 'application/json',
-            'Authorization': "Token {}".format(token)
-        }
-
-        return dest, headers
-
-    def _get_remote_projects(self):
-        if not hasattr(self, '_remote_projects'):
-            dest, headers = self._get_request_info('projects')
-
-            try:
-                response = requests.get(dest, headers=headers)
-                assert response.status_code == 200
-
-                self._remote_projects = response.json()
-            except requests.ConnectionError:
-                raise WatsonError("Unable to reach the server.")
-            except AssertionError:
-                raise WatsonError(
-                    "An error occured with the remote "
-                    "server: {}".format(response.json())
-                )
-
-        return self._remote_projects
+            raise WatsonError(
+                "Sync backend '{}' is not installed.".format(name))
 
     def pull(self):
-        dest, headers = self._get_request_info('frames')
+        backend = self._load_backend()(self.config)
+        last_sync = self.last_sync
+        frames = []
 
-        try:
-            response = requests.get(
-                dest, params={'last_sync': self.last_sync}, headers=headers
-            )
-            assert response.status_code == 200
-        except requests.ConnectionError:
-            raise WatsonError("Unable to reach the server.")
-        except AssertionError:
-            raise WatsonError(
-                "An error occured with the remote "
-                "server: {}".format(response.json())
-            )
-
-        frames = response.json() or ()
-
-        for frame in frames:
-            try:
-                # Try to find the project name, as the API returns an URL
-                project = next(
-                    p['name'] for p in self._get_remote_projects()
-                    if p['url'] == frame['project']
-                )
-            except StopIteration:
-                raise WatsonError(
-                    "Received frame with invalid project from the server "
-                    "(id: {})".format(frame['project']['id'])
-                )
-
-            self.frames[frame['id']] = (project, frame['start'], frame['stop'],
-                                        frame['tags'])
+        for frame in backend.pull(last_sync):
+            if frame.id not in self.frames or frame.updated_at > last_sync:
+                self.frames[frame.id] = frame
+                frames.append(frame)
+            # XXX: what about deleted frames?
 
         return frames
 
     def push(self, last_pull):
-        dest, headers = self._get_request_info('frames/bulk')
-
-        frames = []
-
-        for frame in self.frames:
-            if last_pull > frame.updated_at > self.last_sync:
-                try:
-                    # Find the url of the project
-                    project = next(
-                        p['url'] for p in self._get_remote_projects()
-                        if p['name'] == frame.project
-                    )
-                except StopIteration:
-                    raise WatsonError(
-                        "The project {} does not exists on the remote server, "
-                        "please create it or edit the frame (id: {})".format(
-                            frame.project, frame.id
-                        )
-                    )
-
-                frames.append({
-                    'id': frame.id,
-                    'start': str(frame.start),
-                    'stop': str(frame.stop),
-                    'project': project,
-                    'tags': frame.tags
-                })
-
-        try:
-            response = requests.post(dest, json.dumps(frames), headers=headers)
-            assert response.status_code == 201
-        except requests.ConnectionError:
-            raise WatsonError("Unable to reach the server.")
-        except AssertionError:
-            raise WatsonError(
-                "An error occured with the remote "
-                "server: {}".format(response.json())
-            )
-
-        return frames
+        backend = self._load_backend()(self.config)
+        frames = (frame for frame in self.frames
+                  if last_pull > frame.updated_at > self.last_sync)
+        # XXX: what about deleted frames?
+        return backend.push(frames)
 
     def merge_report(self, frames_with_conflict):
         conflict_file_frames = Frames(self._load_json_file(
